@@ -4,20 +4,73 @@
   import { Cell } from "$lib/Cell";
   import { Wall } from "$lib/Wall";
   import { onMount } from "svelte";
+  import { buildGrid, isPassable } from "$lib/MazeGrid";
+  import { KruskalGenerator } from "$lib/generators/kruskal";
+  import { RecursiveBacktrackerGenerator } from "$lib/generators/recursive-backtracker";
+  import { PrimsGenerator } from "$lib/generators/prims";
+  import { EllersGenerator } from "$lib/generators/ellers";
+  import { WilsonsGenerator } from "$lib/generators/wilsons";
+  import type { MazeGenerator } from "$lib/generators/types";
+  import { BFSSolver } from "$lib/solvers/bfs";
+  import { AStarSolver } from "$lib/solvers/astar";
+  import type { Solver } from "$lib/solvers/types";
+  import { createMarkers } from "$lib/rendering/markers";
+
+  const BG_SIZE = 128;
 
   let canvas: HTMLDivElement;
   let scene: THREE.Scene;
   let camera: THREE.PerspectiveCamera;
   let renderer: THREE.WebGLRenderer;
   let controls: OrbitControls;
-  let agent: THREE.Mesh;
+  let playerMesh: THREE.Mesh;
   let targetPosition: THREE.Vector3;
   let wall_width: number;
   let wall_height: number;
   const keys: Record<string, boolean> = {};
   let isMoving = false;
   let animation = true;
+  let animationSpeed = 20;
   let maze_grid: (Cell | Wall)[][] = [];
+  let mazeReady = false;
+
+  // Convert grid coordinates to world position
+  function gridToWorld(j: number, i: number): { x: number; y: number } {
+    return {
+      x: j * wall_width - BG_SIZE / 2 + wall_width / 2,
+      y: (currentHeight - 1 - i) * wall_height - BG_SIZE / 2 + wall_height / 2,
+    };
+  }
+
+  // Algorithm selection
+  let selectedAlgorithm = "kruskal";
+  const algorithms: Record<string, () => MazeGenerator> = {
+    kruskal: () => new KruskalGenerator(),
+    "recursive-backtracker": () => new RecursiveBacktrackerGenerator(),
+    prims: () => new PrimsGenerator(),
+    ellers: () => new EllersGenerator(),
+    wilsons: () => new WilsonsGenerator(),
+  };
+
+  // Maze dimensions
+  let currentWidth = 0;
+  let currentHeight = 0;
+  let currentDepth = 0;
+  let goalX = 0;
+  let goalY = 0;
+
+  // Solver state
+  let solverMeshes: THREE.Mesh[] = [];
+  let solverRunning = false;
+
+  // Markers
+  let markersGroup: THREE.Group | null = null;
+
+  // Player win detection
+  let playerWon = false;
+
+  let pos_x = 1;
+  let pos_y = 1;
 
   onMount(() => {
     scene = new THREE.Scene();
@@ -29,10 +82,7 @@
     );
     camera.position.z = 100;
 
-    renderer = new THREE.WebGLRenderer({
-      alpha: true,
-      antialias: true,
-    });
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -48,12 +98,10 @@
     controls.maxAzimuthAngle = angle;
 
     canvas.appendChild(renderer.domElement);
-
     animate();
 
     const handleKeyDown = (e: KeyboardEvent) => (keys[e.key] = true);
     const handleKeyUp = (e: KeyboardEvent) => (keys[e.key] = false);
-
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
   });
@@ -64,22 +112,21 @@
     const width = Math.floor(canvas.clientWidth * pixelRatio);
     const height = Math.floor(canvas.clientHeight * pixelRatio);
     const needResize = canvas.width !== width || canvas.height !== height;
-    if (needResize) {
-      renderer.setSize(width, height, false);
-    }
+    if (needResize) renderer.setSize(width, height, false);
     return needResize;
   }
 
   const animate = () => {
     handleMovement();
-    if (agent) {
-      agent.position.lerp(targetPosition, 0.35);
 
-      if (agent.position.distanceTo(targetPosition) < 0.01) {
+    if (playerMesh) {
+      playerMesh.position.lerp(targetPosition, 0.35);
+      if (playerMesh.position.distanceTo(targetPosition) < 0.01) {
         isMoving = false;
-        agent.position.copy(targetPosition);
+        playerMesh.position.copy(targetPosition);
       }
     }
+
     renderer.render(scene, camera);
 
     if (resizeRendererToDisplaySize(renderer)) {
@@ -91,41 +138,30 @@
     requestAnimationFrame(animate);
   };
 
-  let pos_x = 1;
-  let pos_y = 1;
-
   const handleMovement = () => {
-    if (!agent || isMoving) return;
-
-    const isPassable = (tile: Cell | Wall | undefined): boolean => {
-      if (!tile) return false;
-      if (tile instanceof Cell) return true;
-      if (tile instanceof Wall && tile.orientation === -1) return true;
-      return false;
-    };
+    if (!playerMesh || isMoving) return;
 
     if (keys["w"] && isPassable(maze_grid[pos_x]?.[pos_y - 1])) {
       targetPosition.y += wall_height;
       isMoving = true;
       pos_y--;
-    }
-
-    if (keys["s"] && isPassable(maze_grid[pos_x]?.[pos_y + 1])) {
+    } else if (keys["s"] && isPassable(maze_grid[pos_x]?.[pos_y + 1])) {
       targetPosition.y -= wall_height;
       isMoving = true;
       pos_y++;
-    }
-
-    if (keys["a"] && isPassable(maze_grid[pos_x - 1]?.[pos_y])) {
+    } else if (keys["a"] && isPassable(maze_grid[pos_x - 1]?.[pos_y])) {
       targetPosition.x -= wall_width;
       isMoving = true;
       pos_x--;
-    }
-
-    if (keys["d"] && isPassable(maze_grid[pos_x + 1]?.[pos_y])) {
+    } else if (keys["d"] && isPassable(maze_grid[pos_x + 1]?.[pos_y])) {
       targetPosition.x += wall_width;
       isMoving = true;
       pos_x++;
+    }
+
+    // Goal detection
+    if (pos_x === goalX && pos_y === goalY && mazeReady && !playerWon) {
+      playerWon = true;
     }
   };
 
@@ -133,183 +169,142 @@
     maze_grid = [];
     pos_x = 1;
     pos_y = 1;
+    mazeReady = false;
+    playerWon = false;
+    clearSolver();
 
     scene.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         if (obj.geometry) obj.geometry.dispose();
-        if (Array.isArray(obj.material)) {
+        if (Array.isArray(obj.material))
           obj.material.forEach((m) => m.dispose());
-        } else if (obj.material) {
-          obj.material.dispose();
-        }
+        else if (obj.material) obj.material.dispose();
       }
     });
     scene.clear();
+    markersGroup = null;
   };
 
-  const createMaze = (
-    width: number,
-    height: number,
-    depth: number,
-    animation_speed: number,
-  ) => {
+  const createMaze = (width: number, height: number, depth: number) => {
     clearScene();
+    currentWidth = width;
+    currentHeight = height;
+    currentDepth = depth;
+    goalX = width - 2;
+    goalY = height - 2;
 
-    const bg_width = 128;
-    const bg_height = 128;
+    const grid = buildGrid(width, height, depth, scene);
+    maze_grid = grid.maze_grid;
+    wall_width = grid.wall_width;
+    wall_height = grid.wall_height;
 
-    const light = new THREE.DirectionalLight(0xffffff, 4);
-    light.position.set(75, 75, 250);
-    light.target.position.set(bg_width / 2, bg_height / 2, 0);
-    light.castShadow = true;
-    light.shadow.mapSize.width = 1024;
-    light.shadow.mapSize.height = 1024;
-    light.shadow.camera.left = -bg_width;
-    light.shadow.camera.bottom = -bg_height;
-    scene.add(light);
-    scene.add(light.target);
+    const generator = algorithms[selectedAlgorithm]();
+    generator.init(maze_grid, grid.walls, grid.mazeMesh);
 
-    wall_width = bg_width / width;
-    wall_height = bg_height / height;
-
-    const maze_geometry = new THREE.BoxGeometry(bg_width, bg_height, 1);
-    const maze_material = new THREE.MeshStandardMaterial({
-      color: "rgb(0,150,155)",
-    });
-    const maze = new THREE.Mesh(maze_geometry, maze_material);
-    maze.receiveShadow = true;
-    scene.add(maze);
-
-    const wall_geo = new THREE.BoxGeometry(wall_width, wall_height, depth);
-    wall_geo.translate(
-      (bg_width - wall_width) / -2,
-      (bg_height - wall_height) / -2,
-      1,
-    );
-    const wall_mat = new THREE.MeshStandardMaterial({
-      color: "black",
-    });
-
-    let walls: Wall[] = [];
-
-    for (let j = 0; j < width; j++) {
-      maze_grid[j] = new Array(height);
-    }
-
-    for (let i = 1; i < height; i += 2) {
-      for (let j = 1; j < width; j += 2) {
-        const mesh = new THREE.Mesh(wall_geo, wall_mat);
-        mesh.position.x = j * wall_width;
-        mesh.position.y = (height - 1 - i) * wall_height;
-        mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        maze.add(mesh);
-
-        const cell = new Cell(j, i, mesh);
-        maze_grid[j][i] = cell;
+    const runGenerator = () => {
+      const hasMore = generator.step();
+      if (hasMore) {
+        if (animation) setTimeout(runGenerator, animationSpeed);
+        else runGenerator();
+      } else {
+        onMazeComplete(depth, height);
       }
-    }
-
-    for (let i = 0; i < height; i++) {
-      for (let j = 0; j < width; j++) {
-        if (i % 2 == 1 && j % 2 == 1) {
-          continue;
-        }
-        const mesh = new THREE.Mesh(wall_geo, wall_mat);
-        mesh.position.x = j * wall_width;
-        mesh.position.y = (height - 1 - i) * wall_height;
-        mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        maze.add(mesh);
-
-        if (i == 0 || j == 0 || i == height - 1 || j == width - 1) {
-          continue;
-        }
-
-        if (i % 2 == 1) {
-          const left = maze_grid[j - 1][i];
-          const right = maze_grid[j + 1][i];
-
-          if (left instanceof Cell && right instanceof Cell) {
-            const wall = new Wall(left, right, 1, mesh);
-            maze_grid[j][i] = wall;
-            walls.push(wall);
-          }
-        }
-
-        if (j % 2 == 1) {
-          const up = maze_grid[j][i - 1];
-          const down = maze_grid[j][i + 1];
-
-          if (up instanceof Cell && down instanceof Cell) {
-            const wall = new Wall(up, down, 0, mesh);
-            maze_grid[j][i] = wall;
-            walls.push(wall);
-          }
-        }
-      }
-    }
-
-    //fisher-yates shuffle
-    for (let i = walls.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [walls[i], walls[j]] = [walls[j], walls[i]];
-    }
-
-    const kruskal = (walls: Wall[]) => {
-      const step = () => {
-        if (walls.length === 0) return;
-
-        const w = walls.pop();
-        if (!w) return;
-
-        if (Cell.find(w.a) === Cell.find(w.b)) {
-          step();
-          return;
-        }
-
-        w.orientation = -1;
-        maze.remove(w.mesh);
-        maze.remove(w.a.mesh);
-        maze.remove(w.b.mesh);
-        Cell.union(w.a, w.b);
-
-        if (animation) setTimeout(step, animation_speed);
-        else step();
-      };
-
-      step();
     };
+    runGenerator();
 
-    kruskal(walls);
-
+    // Create player
     const agent_geometry = new THREE.SphereGeometry(wall_width / 3, 32, 32);
     agent_geometry.translate(
       -(Math.floor(width / 2) - 1) * wall_width,
       (Math.floor(height / 2) - 1) * wall_height,
       1,
     );
-    const agent_material = new THREE.MeshStandardMaterial({
-      color: "gold",
-    });
-    agent = new THREE.Mesh(agent_geometry, agent_material);
-    agent.castShadow = true;
-    agent.receiveShadow = true;
-    if (depth == 10) agent.position.z++;
-    targetPosition = agent.position.clone();
-    scene.add(agent);
+    const agent_material = new THREE.MeshStandardMaterial({ color: "gold" });
+    playerMesh = new THREE.Mesh(agent_geometry, agent_material);
+    playerMesh.castShadow = true;
+    playerMesh.receiveShadow = true;
+    if (depth == 10) playerMesh.position.z++;
+    targetPosition = playerMesh.position.clone();
+    scene.add(playerMesh);
+  };
+
+  const onMazeComplete = (depth: number, height: number) => {
+    mazeReady = true;
+
+    const startWorld = gridToWorld(1, 1);
+    const goalWorld = gridToWorld(goalX, goalY);
+    const markerRadius = Math.min(wall_width, wall_height) * 0.3;
+    markersGroup = createMarkers(
+      scene,
+      startWorld.x,
+      startWorld.y,
+      goalWorld.x,
+      goalWorld.y,
+      markerRadius,
+      0.6,
+    );
+  };
+
+  // --- Solver ---
+  const clearSolver = () => {
+    for (const m of solverMeshes) {
+      m.geometry.dispose();
+      (m.material as THREE.MeshBasicMaterial).dispose();
+      scene.remove(m);
+    }
+    solverMeshes = [];
+    solverRunning = false;
+  };
+
+  const runSolver = (solver: Solver) => {
+    if (!mazeReady || solverRunning) return;
+    clearSolver();
+    solverRunning = true;
+    solver.init(maze_grid, 1, 1, goalX, goalY);
+
+    const stepSolver = () => {
+      const result = solver.step();
+      if (!result) {
+        solverRunning = false;
+        return;
+      }
+
+      const color = result.type === "solution" ? 0xffff00 : 0x4444ff;
+      const geo = new THREE.PlaneGeometry(wall_width * 0.6, wall_height * 0.6);
+      const mat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: result.type === "solution" ? 0.7 : 0.3,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      const pos = gridToWorld(result.x, result.y);
+      mesh.position.set(pos.x, pos.y, 0.6);
+      scene.add(mesh);
+      solverMeshes.push(mesh);
+
+      setTimeout(stepSolver, 5);
+    };
+    stepSolver();
   };
 </script>
 
 <div class="nav">
-  <h1 style="text-wrap: nowrap">Visualizing Kruskal's Algorithm</h1>
+  <h1 style="text-wrap: nowrap">Maze Algorithm Visualizer</h1>
 
   <p>(use WASD to move)</p>
 
+  <select bind:value={selectedAlgorithm}>
+    <option value="kruskal">Kruskal's</option>
+    <option value="recursive-backtracker">Recursive Backtracker</option>
+    <option value="prims">Prim's</option>
+    <option value="ellers">Eller's</option>
+    <option value="wilsons">Wilson's</option>
+  </select>
+
   <div class="maze-btns">
-    <button onclick={() => createMaze(23, 23, 10, 20)}>SMALL</button>
-    <button onclick={() => createMaze(63, 63, 3, 0)}>MEDIUM</button>
-    <button onclick={() => createMaze(101, 101, 1, 0)}>LARGE</button>
+    <button onclick={() => createMaze(23, 23, 10)}>SMALL</button>
+    <button onclick={() => createMaze(63, 63, 3)}>MEDIUM</button>
+    <button onclick={() => createMaze(101, 101, 1)}>LARGE</button>
   </div>
 
   <button
@@ -318,9 +313,44 @@
       animation = !animation;
     }}
   >
-    Animation: {animation ? "on" : "off"}</button
-  >
+    Animation: {animation ? "on" : "off"}
+  </button>
 </div>
+
+<!-- Side Panel -->
+<div class="side-panel">
+  <div class="panel-section">
+    <h3>Animation Speed</h3>
+    <label class="speed-label">
+      {animationSpeed}ms
+      <input
+        type="range"
+        min="1"
+        max="100"
+        step="1"
+        bind:value={animationSpeed}
+      />
+    </label>
+  </div>
+
+  <div class="panel-section">
+    <h3>Solvers</h3>
+    <button disabled={!mazeReady || solverRunning} onclick={() => runSolver(new BFSSolver())}>
+      Solve: BFS
+    </button>
+    <button disabled={!mazeReady || solverRunning} onclick={() => runSolver(new AStarSolver())}>
+      Solve: A*
+    </button>
+    <button disabled={solverMeshes.length === 0} onclick={clearSolver}>Clear Solution</button>
+  </div>
+</div>
+
+{#if playerWon}
+  <div class="overlay winner">
+    <h1>You reached the goal!</h1>
+    <button onclick={() => (playerWon = false)}>Dismiss</button>
+  </div>
+{/if}
 
 <div bind:this={canvas} class="maze"></div>
 
@@ -354,5 +384,101 @@
     display: flex;
     align-items: center;
     justify-content: space-around;
+  }
+
+  .nav select {
+    padding: 0.5em 1em;
+    font-family: Tahoma;
+    border-radius: 5px;
+    border: 1px solid #333;
+    background: rgb(215, 215, 215);
+    cursor: pointer;
+  }
+
+  .side-panel {
+    position: absolute;
+    top: 80px;
+    right: 10px;
+    width: 220px;
+    background: rgba(20, 20, 20, 0.85);
+    color: white;
+    border-radius: 8px;
+    padding: 12px;
+    font-family: Tahoma;
+    font-size: 0.85em;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .panel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .panel-section h3 {
+    margin: 0;
+    font-size: 1em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    padding-bottom: 4px;
+  }
+
+  .panel-section button {
+    padding: 6px 10px;
+    border: none;
+    border-radius: 4px;
+    background: rgb(60, 60, 60);
+    color: white;
+    cursor: pointer;
+    font-family: Tahoma;
+  }
+
+  .panel-section button:hover:not(:disabled) {
+    background: rgb(80, 80, 80);
+  }
+
+  .panel-section button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .speed-label {
+    font-size: 0.85em;
+  }
+
+  .speed-label input {
+    width: 100%;
+  }
+
+  .overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 100;
+  }
+
+  .overlay h1 {
+    color: white;
+    font-family: Tahoma;
+    font-size: 5em;
+  }
+
+  .overlay button {
+    padding: 10px 20px;
+    font-size: 1.2em;
+    border: none;
+    border-radius: 8px;
+    background: white;
+    cursor: pointer;
+    font-family: Tahoma;
   }
 </style>
